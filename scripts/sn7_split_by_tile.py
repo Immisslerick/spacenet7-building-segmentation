@@ -5,7 +5,8 @@ import random
 def main():
     project_root = Path(__file__).resolve().parent.parent
     subset_path = project_root / "runs" / "sn7_subset.csv"
-    out_path = project_root / "runs" / "sn7_split.csv"
+    out_path = project_root / "runs" / "sn7_split_subset.csv"
+
 
     df = pd.read_csv(subset_path)
 

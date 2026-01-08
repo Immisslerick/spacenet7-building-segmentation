@@ -1,5 +1,4 @@
 from pathlib import Path
-import random
 import numpy as np
 import pandas as pd
 import torch
@@ -8,7 +7,8 @@ import rasterio
 from rasterio.windows import Window
 import imageio.v2 as imageio
 
-# ---- must match your training model ----
+
+# --- Must match the model used in training ---
 def conv_block(in_ch, out_ch):
     return nn.Sequential(
         nn.Conv2d(in_ch, out_ch, 3, padding=1),
@@ -20,7 +20,7 @@ def conv_block(in_ch, out_ch):
     )
 
 class TinyUNet(nn.Module):
-    def __init__(self, in_ch=4, base=32):
+    def __init__(self, in_ch=4, base=64):
         super().__init__()
         self.enc1 = conv_block(in_ch, base)
         self.pool1 = nn.MaxPool2d(2)
@@ -47,22 +47,17 @@ class TinyUNet(nn.Module):
         d1 = self.up1(d2)
         d1 = torch.cat([d1, e1], dim=1)
         d1 = self.dec1(d1)
+
         return self.head(d1)
 
-def to_rgb(img_c):
-    # img_c: (C,H,W) normalized; make a displayable 0-255 RGB
-    c, h, w = img_c.shape
-    if c >= 3:
-        r, g, b = img_c[2], img_c[1], img_c[0]
-        rgb = np.stack([r, g, b], axis=-1)
-    else:
-        rgb = np.repeat(img_c[0][..., None], 3, axis=-1)
 
-    rgb = rgb.astype(np.float32)
-    rgb = rgb - rgb.min()
-    if rgb.max() > 0:
-        rgb = rgb / rgb.max()
-    return (rgb * 255).clip(0, 255).astype(np.uint8)
+def iou(pred: np.ndarray, gt: np.ndarray, eps: float = 1e-6) -> float:
+    pred = pred.astype(bool)
+    gt = gt.astype(bool)
+    inter = np.logical_and(pred, gt).sum()
+    union = np.logical_or(pred, gt).sum()
+    return float((inter + eps) / (union + eps))
+
 
 def main():
     project_root = Path(__file__).resolve().parent.parent
@@ -70,82 +65,89 @@ def main():
     masks_dir = project_root / "data" / "processed" / "masks_png"
     weights = project_root / "runs" / "baseline_unet.pt"
 
-    out_dir = project_root / "runs" / "pred_gallery"
-    out_dir.mkdir(parents=True, exist_ok=True)
+    if not split_csv.exists():
+        raise FileNotFoundError(f"Missing: {split_csv}")
+    if not weights.exists():
+        raise FileNotFoundError(f"Missing: {weights} (did training run and save?)")
 
     df = pd.read_csv(split_csv)
     val_df = df[df["split"] == "val"].copy().reset_index(drop=True)
 
-    device = "cpu"
-    # infer channel count from first val tif
+    # Infer input channels from the first tif
     with rasterio.open(val_df.loc[0, "tif_path"]) as src:
         in_ch = src.count
 
-    sd = torch.load(weights, map_location="cpu")
-    state = sd if isinstance(sd, dict) and "enc1.0.weight" in sd else sd["model"]
+    device = "cpu"
 
-    base = int(state["enc1.0.weight"].shape[0])
+    sd = torch.load(weights, map_location="cpu")
+    # handle either raw state_dict or {"model": state_dict}
+    state = sd if "enc1.0.weight" in sd else sd["model"]
+
+    base = int(state["enc1.0.weight"].shape[0])   # 32/48/64/etc
     in_ch_ckpt = int(state["enc1.0.weight"].shape[1])
 
     print(f"Checkpoint expects in_ch={in_ch_ckpt}, base={base}", flush=True)
 
-    # your tif count should match this
-    model = TinyUNet(in_ch=in_ch_ckpt, base=base).to(device)
+    # sanity: your tif channel count should match checkpoint
+    if in_ch != in_ch_ckpt:
+        raise RuntimeError(f"in_ch mismatch: tif has {in_ch}, checkpoint expects {in_ch_ckpt}")
+
+    model = TinyUNet(in_ch=in_ch, base=base).to(device)
     model.load_state_dict(state)
     model.eval()
 
-    model.eval()
 
-    rng = random.Random(42)
-    n_examples = 12
+    # Sweep settings
     crop = 512
-    thr = 0.35
+    n_crops = 300  # increase for more stable estimate (slower)
+    thresholds = np.arange(0.15, 0.66, 0.05)
 
-    for i in range(1, n_examples + 1):
-        row = val_df.iloc[rng.randrange(len(val_df))]
+    rng = np.random.default_rng(42)
+    scores = {float(t): [] for t in thresholds}
+
+    for _ in range(n_crops):
+        row = val_df.iloc[int(rng.integers(0, len(val_df)))]
         stem = row["filename"]
         tif_path = row["tif_path"]
         mask_path = masks_dir / f"{stem}_mask.png"
 
-        mask_full = imageio.imread(mask_path)
-        mask_full = (mask_full > 127).astype(np.uint8)
+        gt_full = (imageio.imread(mask_path) > 127).astype(np.uint8)
 
         with rasterio.open(tif_path) as src:
             H, W = src.height, src.width
             ch = min(crop, H)
             cw = min(crop, W)
-            y0 = 0 if H <= ch else rng.randrange(0, H - ch)
-            x0 = 0 if W <= cw else rng.randrange(0, W - cw)
+            y0 = 0 if H <= ch else int(rng.integers(0, H - ch))
+            x0 = 0 if W <= cw else int(rng.integers(0, W - cw))
             window = Window(x0, y0, cw, ch)
             img = src.read(window=window).astype(np.float32)
 
-        gt = mask_full[y0:y0+ch, x0:x0+cw]
+        gt = gt_full[y0:y0+ch, x0:x0+cw]
 
-        # normalize same as training
+        # Normalize like training
         mean = img.mean(axis=(1, 2), keepdims=True)
         std = img.std(axis=(1, 2), keepdims=True) + 1e-6
         img_n = (img - mean) / std
 
         x = torch.from_numpy(img_n).unsqueeze(0)  # (1,C,H,W)
         with torch.no_grad():
-            logits = model(x)
-            prob = torch.sigmoid(logits)[0, 0].numpy()
+            prob = torch.sigmoid(model(x))[0, 0].numpy()
 
-        pred = (prob > thr).astype(np.uint8)
+        for t in thresholds:
+            pred = (prob > float(t)).astype(np.uint8)
+            scores[float(t)].append(iou(pred, gt))
 
-        rgb8 = to_rgb(img_n)
-        overlay_gt = rgb8.copy()
-        overlay_pred = rgb8.copy()
-        overlay_gt[gt == 1] = np.array([255, 0, 0], dtype=np.uint8)
-        overlay_pred[pred == 1] = np.array([0, 255, 0], dtype=np.uint8)
+    print("Threshold sweep (mean IoU on random val crops):")
+    best_t, best_iou = None, -1.0
+    for t in sorted(scores.keys()):
+        miou = float(np.mean(scores[t]))
+        print(f"  thr={t:.2f}  mean_IoU={miou:.4f}")
+        if miou > best_iou:
+            best_iou = miou
+            best_t = t
 
-        imageio.imwrite(out_dir / f"{i:02d}_rgb.png", rgb8)
-        imageio.imwrite(out_dir / f"{i:02d}_gt.png", (gt * 255).astype(np.uint8))
-        imageio.imwrite(out_dir / f"{i:02d}_pred.png", (pred * 255).astype(np.uint8))
-        imageio.imwrite(out_dir / f"{i:02d}_overlay_gt.png", overlay_gt)
-        imageio.imwrite(out_dir / f"{i:02d}_overlay_pred.png", overlay_pred)
+    print(f"\nBest threshold: {best_t:.2f}  mean_IoU={best_iou:.4f}")
 
-    print("Wrote gallery to:", out_dir)
 
 if __name__ == "__main__":
     main()

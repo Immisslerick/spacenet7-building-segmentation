@@ -64,8 +64,8 @@ def main():
 
     print(f"Mask cache tasks: {len(tasks)}")
 
-    # i9-9900K: start at 6; bump to 8 if stable
-    max_workers = min(6, os.cpu_count() or 6)
+   
+    max_workers = 28
     print("Workers:", max_workers)
 
     ok = skipped = failed = 0
